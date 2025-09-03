@@ -1,0 +1,61 @@
+Checks: >
+  -*,
+  readability-identifier-naming,
+  -readability-magic-numbers,
+  cppcoreguidelines-*,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-init-variables,
+  -cppcoreguidelines-missing-std-forward,
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  performance-*,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-infinite-loop,
+  misc-*
+
+CheckOptions:
+  - key: bugprone-easily-swappable-parameters.ModelImplicitConversions
+    value: 'false'
+  - key: cppcoreguidelines-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+    value: true
+  - key: misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+    value: true
+# Naming options
+  - key: readability-identifier-naming.ParameterCase
+    value: camelBack
+  - key: readability-identifier-naming.VariableCase
+    value: camelBack
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: CamelCase
+  - key: readability-identifier-naming.ConstantCase
+    value: camelBack
+  - key: readability-identifier-naming.GlobalConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.TypeAliasCase
+    value: CamelCase
+  - key: readability-identifier-naming.MemberCase
+    value: camelBack
+  - key: readability-identifier-naming.PrivateMemberPrefix
+    value: m_
+  - key: readability-identifier-naming.ClassMemberPrefix
+    value: s_
+  - key: readability-identifier-naming.ClassMemberCase
+    value: camelBack
+  - key: readability-identifier-naming.UnionCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.StaticConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.TemplateParameterPattern
+    value: "^T[A-Z][A-Za-z0-9]+$"
+
