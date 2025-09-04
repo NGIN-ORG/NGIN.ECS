@@ -1,52 +1,69 @@
 # NGIN.ECS
 
-High‑performance, data‑oriented Entity Component System (ECS) for C++23. NGIN.ECS stores your data in cache‑friendly columns (SoA), groups entities that share the same components (archetypes), and runs your game/engine logic (systems) deterministically and safely.
+High‑performance, data‑oriented Entity Component System (ECS) for C++23. It stores data in cache‑friendly columns (SoA), groups entities by shared components (archetypes), and runs systems deterministically and safely.
 
-If you’re new to ECS or data‑oriented design, this README walks you through the key ideas step‑by‑step with examples and diagrams.
+If you’re new to ECS or data‑oriented design, this guide introduces the ideas step‑by‑step with example code and diagrams.
 
-— Built to integrate with `NGIN::Base`. Mirrors its build/test style and naming conventions.
+— Designed to integrate cleanly with `NGIN::Base`, mirroring its build/test style and naming conventions.
 
 ## Table of Contents
 
-1. What and Why
-2. Core Concepts (plain English)
-3. Quick Start (10 lines to moving entities)
-4. Step‑By‑Step Tutorial (entities → queries → systems)
-5. How Storage Works (Archetypes + Chunks)
-6. Scheduling & Determinism (Why it’s safe without locks)
-7. Structural Changes with Commands (Deferred but easy)
-8. Change Detection (Added/Changed using epochs)
-9. Examples (build & run)
-10. Build & Install (CMake presets)
-11. API Overview (where to look in the headers)
-12. Architecture Diagrams (PlantUML)
-13. Limitations & Roadmap
-14. FAQ
-15. Contributing & License
+- [1) What and Why](#1-what-and-why)
+- [2) Core Concepts (plain English)](#2-core-concepts-plain-english)
+- [3) Quick Start (10 lines to moving entities)](#3-quick-start-10-lines-to-moving-entities)
+- [4) Step‑By‑Step Tutorial (entities → queries → systems)](#4-step-by-step-tutorial)
+- [5) How Storage Works (Archetypes + Chunks)](#5-how-storage-works-archetypes--chunks)
+- [6) Scheduling & Determinism (Why it’s safe without locks)](#6-scheduling--determinism-why-its-safe-without-locks)
+- [7) Structural Changes with Commands (Deferred but easy)](#7-structural-changes-with-commands-deferred-but-easy)
+- [8) Change Detection (Added/Changed using epochs)](#8-change-detection-addedchanged-using-epochs)
+- [9) Examples (build & run)](#9-examples)
+- [10) Build & Install (CMake presets)](#10-build--install-cmake-presets)
+- [11) API Overview (where to look in the headers)](#11-api-overview-map-to-headers)
+- [12) Architecture Diagrams (PlantUML)](#12-architecture-diagrams-plantuml)
+- [13) Current Limitations & Roadmap](#13-current-limitations--roadmap)
+- [14) FAQ](#14-faq)
+- [15) Contributing & License](#15-contributing--license)
 
 ## 1) What and Why
 
+### Overview
 - ECS breaks your app into:
   - Entities: lightweight IDs for “things”.
   - Components: plain data attached to entities (position, velocity, health...).
-  - Systems: functions that process entities with certain components.
-- Why this ECS?
-  - Performance: SoA layout keeps hot data contiguous for the CPU cache.
-  - Predictability: systems declare what they read/write → the scheduler runs them in a conflict‑free order.
-  - Simplicity: no runtime locks in hot paths; structural changes are deferred in `Commands` and applied at barriers.
+  - Systems: functions that process entities with specific components.
+
+### Why NGIN.ECS
+- Performance: SoA layout keeps hot data contiguous for the CPU cache.
+- Predictability: systems declare what they read/write; the scheduler resolves a safe order.
+- Simplicity: hot paths are lock‑free; structural changes are deferred via `Commands` and applied at barriers.
 
 ## 2) Core Concepts (plain English)
 
-- Entity: a 64‑bit ID. It’s just a handle; data lives in components.
-- Component: a struct of data (e.g. `struct Transform { float x,y,z; };`).
-- Archetype: a group of entities that have the exact same set of components. Stored in SoA “columns”.
-- Chunk: a small block of storage (e.g. 64 KB) inside an archetype. Holds many entities worth of columns.
-- Query: “give me chunks that have components X and Y (but not Z)”. Iterates chunks for maximal locality.
-- System: a function that runs queries. It declares what it reads/writes so the scheduler can order systems safely.
-- Commands: a “to‑do list” for structural changes (spawn, despawn, add/remove components). Applied at stage barriers.
-- Epoch: a frame/phase counter. We track what was Added/Changed “in this epoch” for change‑driven systems.
+### Entities
+- A 64‑bit ID. It’s just a handle; data lives in components.
+
+### Components
+- Plain structs of data (e.g. `struct Transform { float x,y,z; };`).
+
+### Archetypes & Chunks
+- Archetype: entities that have the exact same set of components, stored in SoA columns.
+- Chunk: fixed‑size block (e.g. 64 KB) inside an archetype, holding columnar data for many entities.
+
+### Queries
+- “Give me chunks that have components X and Y (but not Z)”. Iterate by chunk for locality.
+
+### Systems
+- Functions that run queries. They declare reads/writes so the scheduler can order them safely.
+
+### Commands
+- A to‑do list for structural changes (spawn, despawn, add/remove components). Applied at barriers.
+
+### Epochs
+- A frame/phase counter to support `Added<T>`/`Changed<T>` change detection.
 
 ## 3) Quick Start (10 lines to moving entities)
+
+### Example
 
 ```cpp
 #include <NGIN/ECS/World.hpp>
@@ -67,24 +84,27 @@ q.for_chunks([&](const NGIN::ECS::ChunkView& chunk){
 });
 ```
 
-You just:
+### What happened
 - Spawned entities with `Transform` and `Velocity`.
 - Built a query that Writes `Transform` and Reads `Velocity`.
 - Iterated by chunk for cache‑friendly updates.
 
 ## 4) Step‑By‑Step Tutorial
 
+### Define components
 1. Define your components:
    ```cpp
    struct Transform { float x, y, z; };
    struct Velocity  { float vx, vy, vz; };
    struct PlayerTag {};
    ```
+### Spawn entities
 2. Spawn entities (typed API chooses the right archetype automatically):
    ```cpp
    World world;
    auto e = world.Spawn(Transform{0,0,0}, Velocity{1,0,0}, PlayerTag{});
    ```
+### Write a system
 3. Process in systems/queries:
    ```cpp
    Query<Write<Transform>, Read<Velocity>, With<PlayerTag>> q{world};
@@ -94,6 +114,7 @@ You just:
      for (auto i=c.begin(); i<c.end(); ++i) t[i].x += v[i].vx;
    });
    ```
+### Defer changes
 4. Defer spawns/despawns with Commands and flush at a barrier:
    ```cpp
    Scheduler sched;
@@ -106,46 +127,59 @@ You just:
 
 ## 5) How Storage Works (Archetypes + Chunks)
 
-- An archetype is the set of component types. Each archetype has many chunks.
-- Chunks are fixed‑size blocks (default 64 KB). Each component is a column (SoA array) inside the chunk.
-- Adding/removing a component moves the entity between archetypes (fast `memcpy` per column in batches — coming in the next phase).
+### Archetypes
+- An archetype is the set of component types. Each archetype owns many chunks.
 
-Why SoA? Iterating `Transform` and `Velocity` in tight loops reads contiguous arrays, which is cache‑friendly and fast.
+### Chunks
+- Fixed‑size blocks (default 64 KB). Each component is a column (SoA array) inside the chunk.
+- Adding/removing a component moves the entity between archetypes (batched moves designed to be cache‑friendly).
+
+### Why SoA
+- Tight loops over `Transform` and `Velocity` read contiguous arrays → cache‑friendly and fast.
 
 ## 6) Scheduling & Determinism (Why it’s safe without locks)
 
+### Access declarations
 - Each system declares the components/resources it reads or writes.
-- The scheduler builds a dependency graph:
-  - Write vs Read or Write vs Write on the same type → add an edge.
-- Systems run in stages so they never conflict. Within a stage, work can be parallelised by chunk (future work).
-- Same inputs → same execution order → deterministic results.
+
+### Dependency graph
+- The scheduler builds a DAG: write/read and write/write conflicts on the same type create edges.
+- Systems run in stages that never conflict. Within a stage, work can be parallelised by chunk (future work).
+
+### Determinism
+- Same inputs → same order → reproducible results.
 
 ## 7) Structural Changes with Commands (Deferred but easy)
 
-- Systems shouldn’t modify archetype layouts mid‑iteration (that would cause data to move under your feet).
-- Instead, record ops in `Commands`:
-  - `cmd.Spawn<Ts...>(values...)`
-  - `cmd.Despawn(entity)`
-  - (Planned) `cmd.Add<T>`, `cmd.Remove<T>`, `cmd.Set<T>`
-- Commands are applied all at once at a barrier (between scheduler stages).
+### Why deferred
+- Systems shouldn’t modify archetype layouts mid‑iteration (data could move under your feet).
+
+### Common operations
+- `cmd.Spawn<Ts...>(values...)`
+- `cmd.Despawn(entity)`
+- (Planned) `cmd.Add<T>`, `cmd.Remove<T>`, `cmd.Set<T>`
+
+### Barrier apply
+- Commands are applied at a barrier between scheduler stages.
 
 ## 8) Change Detection (Added/Changed using epochs)
 
-- The world has an epoch counter (think: “frame id”).
-- Each chunk keeps a per‑column “write” and “add” clock stamped with the current epoch.
-- Queries can filter by:
-  - `Added<T>`: matched this epoch (chunk contains T added in current epoch).
-  - `Changed<T>`: written this epoch (query with `Write<T>` marks the chunk’s write clock).
-- Advance with `world.NextEpoch()` when you want change filters to reset.
+### Epochs
+- The world tracks an epoch counter (think “frame id”).
+- Each chunk maintains per‑column “write” and “add” clocks stamped with the current epoch.
+
+### Filters
+- `Added<T>`: component added this epoch.
+- `Changed<T>`: component written this epoch (queries with `Write<T>` mark the clock).
+- Advance with `world.NextEpoch()` to roll the window forward.
 
 ## 9) Examples
 
-Two buildable examples live under `examples/`:
-
+### Projects
 - `QuickStart`: spawns entities, runs a move query, and demonstrates scheduler barrier flush.
 - `ChangeDetection`: demonstrates `Added<T>`/`Changed<T>` filters and epoch advancement.
 
-Build & run:
+### Build & run
 
 ```
 cmake --preset examples
@@ -156,7 +190,11 @@ cmake --build --preset examples-debug -j
 
 ## 10) Build & Install (CMake presets)
 
-Presets use Ninja Multi‑Config. Requirements: C++23 compiler and `NGIN::Base` available (package, sibling checkout, or `NGIN_BASE_SOURCE_DIR`).
+### Requirements
+- C++23 compiler
+- `NGIN::Base` available (package, sibling checkout, or `NGIN_BASE_SOURCE_DIR`)
+
+### Common presets
 
 ```
 # Library only (tests OFF)
@@ -177,7 +215,7 @@ cmake --preset install
 cmake --build --preset install-release
 ```
 
-Key options:
+### Options
 - `NGIN_ECS_BUILD_TESTS` (ON/OFF)
 - `NGIN_ECS_BUILD_EXAMPLES` (ON/OFF)
 
@@ -193,7 +231,7 @@ Key options:
 
 ## 12) Architecture Diagrams (PlantUML)
 
-Component view:
+### Component view
 
 ```plantuml
 @startuml
@@ -225,7 +263,7 @@ end note
 @enduml
 ```
 
-Stage/barrier sequence:
+### Stage/barrier sequence
 
 ```plantuml
 @startuml
@@ -253,13 +291,13 @@ deactivate Scheduler
 
 ## 13) Current Limitations & Roadmap
 
-Current limitations (MVP):
+### Current limitations (MVP)
 - Scheduler executes single‑threaded.
 - Despawn only retires entity IDs; physical removal/backfill is not yet implemented.
 - Optional/partial access (`Opt<T>`) does not yet affect matching.
 - Version clocks are chunk‑level; no per‑row dirty masks yet.
 
-Roadmap:
+### Roadmap
 1. Parallel job system: chunk sharding, work‑stealing pool, deterministic sharding order.
 2. Command buffers v2: lock‑free MPSC per worker, batched moves, add/remove/set ops.
 3. Events & messaging: typed MPMC channels, double‑buffered per frame.
@@ -281,8 +319,10 @@ Roadmap:
 
 ## 15) Contributing & License
 
+### Contributing
 - Tests use Boost.UT with case discovery via CTest (`tests/`).
 - Style follows NGIN.Base conventions. Public headers are under `include/NGIN/ECS/`.
 - Please keep PRs focused and add tests.
 
-This project is licensed under the license in `LICENSE` (same as other NGIN family repos).
+### License
+This project is licensed under the license in `LICENSE` (shared with other NGIN family repos).
