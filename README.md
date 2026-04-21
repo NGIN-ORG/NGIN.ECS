@@ -1,185 +1,191 @@
 # NGIN.ECS
 
-NGIN.ECS is a C++23 library for organizing game or simulation logic using an **entity-component-system (ECS)** model.
+`NGIN.ECS` is a C++23 library for organizing game, simulation, and tool logic with an entity-component-system model.
 
-If you haven’t used an ECS before, the idea is simple:
+If that phrase is new to you, the short version is:
 
-* **Entities** are just IDs
-* **Components** are plain data (position, velocity, health, etc.)
-* **Systems** run over many entities at once and update that data
+- an **entity** is just an ID
+- a **component** is a piece of data, like position, velocity, health, or a tag
+- a **system** is code that runs over many matching entities and updates their data
 
-Instead of attaching behavior to objects, you write logic that operates on groups of data.
+Instead of building behavior around large object hierarchies, you keep the data simple and run logic over groups of
+that data.
 
----
+## Why You Might Want This
 
-## A minimal example
+This style is useful when your program has a lot of things that share common kinds of state:
+
+- players and enemies in a game
+- particles and projectiles
+- simulation agents
+- runtime objects in an editor or preview tool
+
+It helps when you want:
+
+- data laid out predictably
+- one piece of logic to process many objects at once
+- clean separation between data and behavior
+- explicit control over updates and structural changes
+
+## What NGIN.ECS Tries To Be
+
+`NGIN.ECS` is not trying to hide the ECS model behind a lot of framework code.
+
+It is designed to be:
+
+- explicit
+- data-oriented
+- friendly to normal C++ component types
+- clear about when things change
+
+In practice, that means:
+
+- entities are lightweight handles
+- component access is direct
+- despawn and clear happen immediately
+- systems describe their data needs through typed parameters
+- change tracking is row-based instead of broad chunk-level guessing
+
+## Smallest Useful Example
 
 ```cpp
+#include <NGIN/ECS/World.hpp>
+#include <NGIN/ECS/Query.hpp>
+
 struct Transform { float x, y, z; };
 struct Velocity  { float vx, vy, vz; };
 
-World world;
+int main()
+{
+    NGIN::ECS::World world;
 
-world.Spawn(
-    Transform{0, 0, 0},
-    Velocity{1, 0, 0}
-);
+    (void)world.Spawn(
+        Transform{0.0f, 0.0f, 0.0f},
+        Velocity{1.0f, 0.0f, 0.0f}
+    );
 
-Query<Write<Transform>, Read<Velocity>> query {world};
+    NGIN::ECS::Query<
+        NGIN::ECS::Write<Transform>,
+        NGIN::ECS::Read<Velocity>
+    > query {world};
 
-query.ForEach([&](const RowView& row) {
-    auto& t = row.Write<Transform>();
-    const auto& v = row.Read<Velocity>();
+    query.ForEach([&](const NGIN::ECS::RowView& row) {
+        auto&       transform = row.Write<Transform>();
+        const auto& velocity  = row.Read<Velocity>();
 
-    t.x += v.vx;
-});
+        transform.x += velocity.vx;
+        transform.y += velocity.vy;
+        transform.z += velocity.vz;
+
+        row.MarkChanged<Transform>();
+    });
+}
 ```
 
-This updates every entity that has both `Transform` and `Velocity`.
+What this means in plain language:
 
----
+1. create a world
+2. spawn one entity with a `Transform` and a `Velocity`
+3. ask for every row that has both components
+4. update the position from the velocity
 
-## How to think about it
+## What Makes This Library Practical
 
-NGIN.ECS stores entities in tables (called **archetypes**) based on the components they have.
+### You work with normal C++ component types
 
-A query like:
+Components do not have to be tiny POD-only structs.
 
-```cpp
-Query<Write<Transform>, Read<Velocity>>
-```
+`NGIN.ECS` supports normal C++ lifecycle behavior for things like:
 
-means:
+- `std::string`
+- `std::vector<T>`
+- move-only wrappers
 
-> “Give me all rows where both of these components exist.”
+### Direct world operations are simple
 
-Each iteration gives you direct access to that row’s data — no lookups, no indirection.
-
----
-
-## Why this style is useful
-
-This approach makes it easy to:
-
-* process large numbers of entities efficiently
-* keep data layout predictable
-* separate data from behavior cleanly
-
-It’s commonly used in:
-
-* games
-* simulations
-* real-time systems
-
----
-
-## What NGIN.ECS focuses on
-
-Instead of trying to hide how ECS works, NGIN.ECS keeps things explicit:
-
-### Direct data access
-
-You work with references to components directly:
+Typical operations look like this:
 
 ```cpp
-auto& transform = row.Write<Transform>();
-```
+auto entity = world.Spawn(Transform{0, 0, 0});
 
-There’s no wrapper or proxy layer.
+world.Add<Velocity>(entity, Velocity{1, 0, 0});
+world.Set<Transform>(entity, Transform{5, 0, 0});
 
----
+const auto& transform = world.Get<Transform>(entity);
 
-### Normal C++ types
-
-Components can be anything:
-
-* `std::string`
-* `std::vector<T>`
-* move-only types
-
-They behave exactly as expected (construct, move, destroy).
-
----
-
-### Immediate changes
-
-When you remove something, it’s gone:
-
-```cpp
 world.Despawn(entity);
 ```
 
-There’s no delayed cleanup step to keep track of.
+### Systems describe what they need
 
----
-
-### Systems describe their inputs
+Instead of passing every system a raw `World&` and hoping it behaves, systems are normally written with typed params:
 
 ```cpp
-MakeSystem("Move", [](Query<
-    Write<Transform>,
-    Read<Velocity>
->& query) {
-    ...
+auto moveSystem = NGIN::ECS::MakeSystem("Move", [](
+    NGIN::ECS::Query<
+        NGIN::ECS::Write<Transform>,
+        NGIN::ECS::Read<Velocity>
+    >& query
+) {
+    query.ForEach([&](const NGIN::ECS::RowView& row) {
+        auto&       transform = row.Write<Transform>();
+        const auto& velocity  = row.Read<Velocity>();
+        transform.x += velocity.vx;
+        row.MarkChanged<Transform>();
+    });
 });
 ```
 
-The types in the function signature describe what the system reads and writes.
+That gives the scheduler real information about what the system reads and writes.
 
-This is used to organize execution safely.
+### Deferred structural changes are available when you need them
 
----
-
-## Common operations
+If a system needs to queue changes to apply after the current stage, it can use `Commands`:
 
 ```cpp
-auto e = world.Spawn(Transform{...});
-
-world.Get<Transform>(e);
-world.GetMut<Transform>(e);
-
-world.Add<Velocity>(e, {...});
-world.Remove<Velocity>(e);
-
-world.Despawn(e);
+auto spawnSystem = NGIN::ECS::MakeSystem("Spawn", [](
+    NGIN::ECS::Commands& commands
+) {
+    commands.Spawn(Transform{0, 0, 0});
+});
 ```
 
----
+## If You Are New To ECS
 
-## Change detection
+The easiest way to think about it is:
 
-You can track what changed between frames:
+- the **world** owns all ECS data
+- each **entity** is one thing in that world
+- each **component** is one kind of state
+- each **query** says which kinds of state you want
+- each **system** runs logic over matching rows
 
-```cpp
-world.MarkChanged<Transform>(entity);
+You do not need to understand every storage detail to get started. You can begin with:
 
-Query<Changed<Transform>> query {world};
-```
+- `World`
+- `Spawn`
+- `Query`
+- `RowView`
+- `Scheduler`
 
-Use `world.NextEpoch()` to advance the frame.
+Then learn the deeper parts as needed.
 
----
+## Start Here
 
-## Running systems
+If you want the guided docs path, use this order:
 
-```cpp
-Scheduler scheduler;
-
-scheduler.Register(moveSystem);
-scheduler.Build();
-scheduler.Run(world);
-```
-
-Systems are grouped and executed in a safe order based on what they access.
-
----
+1. [Documentation Index](docs/README.md)
+2. [Quick Start](docs/QuickStart.md)
+3. [Entities And World](docs/Entities.md)
+4. [Queries](docs/Queries.md)
+5. [Systems And Scheduler](docs/Systems.md)
+6. [Commands](docs/Commands.md)
+7. [Change Detection](docs/ChangeDetection.md)
 
 ## Examples
 
-* `examples/QuickStart/`
-* `examples/ChangeDetection/`
-
----
+- `examples/QuickStart/`
+- `examples/ChangeDetection/`
 
 ## Build
 
@@ -192,14 +198,17 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
----
+Optional benchmark build:
 
-## In short
+```bash
+cmake -S . -B build \
+  -DNGIN_ECS_BUILD_BENCHMARKS=ON
 
-NGIN.ECS gives you:
+cmake --build build --target ECSBenchmarks -j
+```
 
-* a way to organize data as components
-* a way to process that data in batches
-* full control over how and when things change
+## Read Next
 
-Without hiding how it works.
+- [docs/README.md](docs/README.md)
+- [docs/QuickStart.md](docs/QuickStart.md)
+- [docs/API.md](docs/API.md)
