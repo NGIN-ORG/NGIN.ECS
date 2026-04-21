@@ -4,300 +4,495 @@
 #include <NGIN/Containers/Vector.hpp>
 #include <NGIN/Hashing/FNV.hpp>
 #include <NGIN/Memory/SystemAllocator.hpp>
+#include <NGIN/Memory/SmartPointers.hpp>
 #include <NGIN/ECS/Entity.hpp>
 #include <NGIN/ECS/TypeRegistry.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 
 namespace NGIN::ECS
 {
     inline constexpr NGIN::UIntSize kDefaultChunkBytes = 64 * 1024;
+    inline constexpr NGIN::UIntSize kInvalidIndex      = (std::numeric_limits<NGIN::UIntSize>::max)();
 
     struct ArchetypeSignature
     {
-        NGIN::Containers::Vector<TypeId> Types; // canonical sorted order
-        NGIN::UInt64                      Hash {0};
+        NGIN::Containers::Vector<TypeId> Types;
+        NGIN::UInt64                     Hash {0};
 
         [[nodiscard]] bool operator==(const ArchetypeSignature& other) const noexcept
         {
-            if (Hash != other.Hash)
-                return false; // fast path, tolerate collision via Types compare next
-            if (Types.Size() != other.Types.Size())
+            if (Hash != other.Hash || Types.Size() != other.Types.Size())
+            {
                 return false;
+            }
             for (NGIN::UIntSize i = 0; i < Types.Size(); ++i)
+            {
                 if (Types[i] != other.Types[i])
+                {
                     return false;
+                }
+            }
             return true;
         }
 
         [[nodiscard]] static ArchetypeSignature FromUnordered(NGIN::Containers::Vector<TypeId> values)
         {
-            // Sort and deduplicate
             std::sort(values.begin(), values.end());
             auto last    = std::unique(values.begin(), values.end());
             auto newSize = static_cast<NGIN::UIntSize>(last - values.begin());
             while (values.Size() > newSize)
-                values.PopBack();
-            // Hash all type ids
-            NGIN::UInt64 h = 1469598103934665603ULL; // base seed
-            for (auto& v: values)
             {
-                const auto* p = reinterpret_cast<const char*>(&v);
-                const auto hv = NGIN::Hashing::FNV1a64(p, sizeof(TypeId));
-                // 64-bit mix (boost style)
-                h ^= hv + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                values.PopBack();
             }
-            ArchetypeSignature sig {};
-            sig.Types = std::move(values);
-            sig.Hash  = h;
-            return sig;
-        }
-    };
 
-    struct ColumnLayout
-    {
-        ComponentInfo Info {};
-        NGIN::UIntSize Stride {0}; // bytes per element (equals Info.Size for POD/direct storage)
+            NGIN::UInt64 hash = 1469598103934665603ULL;
+            for (const auto typeId : values)
+            {
+                const auto componentHash = NGIN::Hashing::FNV1a64(
+                    reinterpret_cast<const char*>(&typeId),
+                    sizeof(TypeId)
+                );
+                hash ^= componentHash + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+            }
+
+            ArchetypeSignature signature {};
+            signature.Types = std::move(values);
+            signature.Hash  = hash;
+            return signature;
+        }
     };
 
     struct ComponentPayload
     {
-        TypeId                   id {0};
-        const void*              data {nullptr};
-        NGIN::UIntSize           size {0};
-        NGIN::UIntSize           align {1};
+        TypeId           id {0};
+        ComponentInfo    Info {};
+        const void*      Data {nullptr};
+        bool             MoveConstruct {false};
+    };
+
+    struct ArchetypeRowAddress
+    {
+        NGIN::UIntSize ChunkIndex {kInvalidIndex};
+        NGIN::UIntSize RowIndex {kInvalidIndex};
     };
 
     class Chunk
     {
     public:
-        Chunk() = default;
-        Chunk(const NGIN::Containers::Vector<ColumnLayout>& columns, NGIN::UIntSize capacity)
+        explicit Chunk(const NGIN::Containers::Vector<ComponentInfo>& components, NGIN::UIntSize capacity)
             : m_capacity(capacity)
         {
-            m_columnsData.Reserve(columns.Size());
-            for (NGIN::UIntSize i = 0; i < columns.Size(); ++i)
-            {
-                if (columns[i].Info.IsEmpty || columns[i].Stride == 0)
-                {
-                    m_columnsData.EmplaceBack(nullptr);
-                }
-                else
-                {
-                    void* mem = m_alloc.Allocate(columns[i].Stride * capacity, columns[i].Info.Align);
-                    if (!mem) throw std::bad_alloc();
-                    m_columnsData.EmplaceBack(mem);
-                }
-            }
+            m_columns.Reserve(components.Size());
             m_entities.Reserve(capacity);
-            // Initialize version clocks per column
-            m_writeVersion.Reserve(columns.Size());
-            m_addVersion.Reserve(columns.Size());
-            for (NGIN::UIntSize i = 0; i < columns.Size(); ++i)
+            for (NGIN::UIntSize columnIndex = 0; columnIndex < components.Size(); ++columnIndex)
             {
-                m_writeVersion.EmplaceBack(0);
-                m_addVersion.EmplaceBack(0);
+                Column column {};
+                column.Info = components[columnIndex];
+
+                if (!column.Info.IsEmpty)
+                {
+                    column.Data = m_allocator.Allocate(column.Info.Size * capacity, column.Info.Align);
+                    if (!column.Data)
+                    {
+                        throw std::bad_alloc();
+                    }
+                }
+
+                column.AddedTicks = static_cast<NGIN::UInt64*>(
+                    m_allocator.Allocate(sizeof(NGIN::UInt64) * capacity, alignof(NGIN::UInt64))
+                );
+                column.ChangedTicks = static_cast<NGIN::UInt64*>(
+                    m_allocator.Allocate(sizeof(NGIN::UInt64) * capacity, alignof(NGIN::UInt64))
+                );
+                if (!column.AddedTicks || !column.ChangedTicks)
+                {
+                    throw std::bad_alloc();
+                }
+
+                std::memset(column.AddedTicks, 0, sizeof(NGIN::UInt64) * capacity);
+                std::memset(column.ChangedTicks, 0, sizeof(NGIN::UInt64) * capacity);
+                m_columns.EmplaceBack(column);
             }
         }
 
+        Chunk(const Chunk&)            = delete;
+        Chunk& operator=(const Chunk&) = delete;
+        Chunk(Chunk&&)                 = delete;
+        Chunk& operator=(Chunk&&)      = delete;
+
         ~Chunk()
         {
-            for (NGIN::UIntSize i = 0; i < m_columnsData.Size(); ++i)
+            Reset();
+            for (NGIN::UIntSize columnIndex = 0; columnIndex < m_columns.Size(); ++columnIndex)
             {
-                if (m_columnsData[i])
+                auto& column = m_columns[columnIndex];
+                if (column.Data)
                 {
-                    // Note: no dtor calls because MVP supports POD-first direct columns
-                    // Non-POD to be handled via blob store in later phases
-                    m_alloc.Deallocate(m_columnsData[i], 0, 0);
+                    m_allocator.Deallocate(column.Data, column.Info.Size * m_capacity, column.Info.Align);
+                }
+                if (column.AddedTicks)
+                {
+                    m_allocator.Deallocate(column.AddedTicks, sizeof(NGIN::UInt64) * m_capacity, alignof(NGIN::UInt64));
+                }
+                if (column.ChangedTicks)
+                {
+                    m_allocator.Deallocate(column.ChangedTicks,
+                                           sizeof(NGIN::UInt64) * m_capacity,
+                                           alignof(NGIN::UInt64));
                 }
             }
         }
 
         [[nodiscard]] NGIN::UIntSize Capacity() const noexcept { return m_capacity; }
         [[nodiscard]] NGIN::UIntSize Count() const noexcept { return m_count; }
-        [[nodiscard]] bool           HasRoom() const noexcept { return m_count < m_capacity; }
-        [[nodiscard]] void*          ColumnPtr(NGIN::UIntSize i) noexcept { return m_columnsData[i]; }
-        [[nodiscard]] const void*    ColumnPtr(NGIN::UIntSize i) const noexcept { return m_columnsData[i]; }
-        [[nodiscard]] NGIN::UInt64   WriteVersion(NGIN::UIntSize col) const noexcept { return m_writeVersion[col]; }
-        [[nodiscard]] NGIN::UInt64   AddedVersion(NGIN::UIntSize col) const noexcept { return m_addVersion[col]; }
-        void                         BumpWriteVersion(NGIN::UIntSize col, NGIN::UInt64 epoch) noexcept { m_writeVersion[col] = epoch; }
-        void                         BumpAddVersion(NGIN::UIntSize col, NGIN::UInt64 epoch) noexcept { m_addVersion[col] = epoch; }
+        [[nodiscard]] bool HasRoom() const noexcept { return m_count < m_capacity; }
 
-        void AddRow(EntityId id,
-                    const NGIN::Containers::Vector<ColumnLayout>& columns,
-                    const void* const*                             values,
-                    NGIN::UInt64                                   epoch)
+        [[nodiscard]] EntityId EntityAt(NGIN::UIntSize row) const noexcept { return m_entities[row]; }
+        [[nodiscard]] const EntityId* Entities() const noexcept { return m_entities.data(); }
+
+        [[nodiscard]] bool HasColumn(NGIN::UIntSize columnIndex) const noexcept
         {
-            const auto row = m_count;
-            if (!(row < m_capacity)) throw std::out_of_range("Chunk full");
-            m_entities.EmplaceBack(id);
-            for (NGIN::UIntSize c = 0; c < columns.Size(); ++c)
+            return columnIndex < m_columns.Size();
+        }
+
+        [[nodiscard]] const ComponentInfo& ColumnInfo(NGIN::UIntSize columnIndex) const noexcept
+        {
+            return m_columns[columnIndex].Info;
+        }
+
+        [[nodiscard]] void* ComponentPtr(NGIN::UIntSize columnIndex, NGIN::UIntSize row) noexcept
+        {
+            auto& column = m_columns[columnIndex];
+            if (column.Info.IsEmpty)
             {
-                if (!(columns[c].Info.IsEmpty || columns[c].Stride == 0))
-                {
-                    const auto* src = values[c];
-                    if (!src)
-                        throw std::invalid_argument("Missing component value for column");
-                    auto* base = static_cast<char*>(m_columnsData[c]);
-                    std::memcpy(base + row * columns[c].Stride, src, columns[c].Stride);
-                }
-                // Mark as added at this epoch for all columns (including tags)
-                m_addVersion[c] = epoch;
+                return nullptr;
             }
+            return static_cast<std::byte*>(column.Data) + (row * column.Info.Size);
+        }
+
+        [[nodiscard]] const void* ComponentPtr(NGIN::UIntSize columnIndex, NGIN::UIntSize row) const noexcept
+        {
+            const auto& column = m_columns[columnIndex];
+            if (column.Info.IsEmpty)
+            {
+                return nullptr;
+            }
+            return static_cast<const std::byte*>(column.Data) + (row * column.Info.Size);
+        }
+
+        [[nodiscard]] NGIN::UInt64 AddedTick(NGIN::UIntSize columnIndex, NGIN::UIntSize row) const noexcept
+        {
+            return m_columns[columnIndex].AddedTicks[row];
+        }
+
+        [[nodiscard]] NGIN::UInt64 ChangedTick(NGIN::UIntSize columnIndex, NGIN::UIntSize row) const noexcept
+        {
+            return m_columns[columnIndex].ChangedTicks[row];
+        }
+
+        void SetAddedTick(NGIN::UIntSize columnIndex, NGIN::UIntSize row, NGIN::UInt64 tick) noexcept
+        {
+            m_columns[columnIndex].AddedTicks[row] = tick;
+        }
+
+        void SetChangedTick(NGIN::UIntSize columnIndex, NGIN::UIntSize row, NGIN::UInt64 tick) noexcept
+        {
+            m_columns[columnIndex].ChangedTicks[row] = tick;
+        }
+
+        [[nodiscard]] NGIN::UIntSize BeginRow(EntityId entityId)
+        {
+            if (!HasRoom())
+            {
+                throw std::out_of_range("Chunk is full.");
+            }
+            const auto row = m_count;
+            m_entities.EmplaceBack(entityId);
             ++m_count;
+            return row;
+        }
+
+        void RollbackNewRow(NGIN::UIntSize row, NGIN::UIntSize constructedColumns) noexcept
+        {
+            for (NGIN::UIntSize columnIndex = 0; columnIndex < constructedColumns; ++columnIndex)
+            {
+                DestroyElement(columnIndex, row);
+            }
+            if (m_entities.Size() > 0)
+            {
+                m_entities.PopBack();
+            }
+            if (m_count > 0)
+            {
+                --m_count;
+            }
+        }
+
+        void DestroyRow(NGIN::UIntSize row) noexcept
+        {
+            for (NGIN::UIntSize columnIndex = 0; columnIndex < m_columns.Size(); ++columnIndex)
+            {
+                DestroyElement(columnIndex, row);
+            }
+        }
+
+        struct RemoveRowResult
+        {
+            bool               HadMovedEntity {false};
+            EntityId           MovedEntity {NullEntityId};
+            NGIN::UIntSize     NewRowIndex {kInvalidIndex};
+        };
+
+        [[nodiscard]] RemoveRowResult SwapRemoveRow(NGIN::UIntSize row)
+        {
+            if (row >= m_count)
+            {
+                throw std::out_of_range("Row index out of range.");
+            }
+
+            RemoveRowResult result {};
+            const auto lastRow = m_count - 1;
+
+            DestroyRow(row);
+            if (row != lastRow)
+            {
+                result.HadMovedEntity = true;
+                result.MovedEntity    = m_entities[lastRow];
+                result.NewRowIndex    = row;
+
+                for (NGIN::UIntSize columnIndex = 0; columnIndex < m_columns.Size(); ++columnIndex)
+                {
+                    MoveElement(columnIndex, lastRow, row);
+                    m_columns[columnIndex].AddedTicks[row]   = m_columns[columnIndex].AddedTicks[lastRow];
+                    m_columns[columnIndex].ChangedTicks[row] = m_columns[columnIndex].ChangedTicks[lastRow];
+                }
+                m_entities[row] = result.MovedEntity;
+            }
+
+            if (m_entities.Size() > 0)
+            {
+                m_entities.PopBack();
+            }
+            --m_count;
+            return result;
+        }
+
+        void Reset() noexcept
+        {
+            for (NGIN::UIntSize row = 0; row < m_count; ++row)
+            {
+                DestroyRow(row);
+            }
+            m_entities.Clear();
+            m_count = 0;
         }
 
     private:
-        NGIN::Memory::SystemAllocator                m_alloc {};
-        NGIN::Containers::Vector<void*>              m_columnsData; // size = columns
-        NGIN::Containers::Vector<EntityId>           m_entities;
-        NGIN::Containers::Vector<NGIN::UInt64>       m_writeVersion; // per column
-        NGIN::Containers::Vector<NGIN::UInt64>       m_addVersion;   // per column
-        NGIN::UIntSize                               m_count {0};
-        NGIN::UIntSize                               m_capacity {0};
+        struct Column
+        {
+            ComponentInfo  Info {};
+            void*          Data {nullptr};
+            NGIN::UInt64*  AddedTicks {nullptr};
+            NGIN::UInt64*  ChangedTicks {nullptr};
+        };
+
+        void DestroyElement(NGIN::UIntSize columnIndex, NGIN::UIntSize row) noexcept
+        {
+            auto& column = m_columns[columnIndex];
+            if (column.Info.IsEmpty || !column.Info.Destroy || row >= m_count)
+            {
+                return;
+            }
+            column.Info.Destroy(ComponentPtr(columnIndex, row));
+        }
+
+        void MoveElement(NGIN::UIntSize columnIndex, NGIN::UIntSize sourceRow, NGIN::UIntSize destinationRow)
+        {
+            auto& column = m_columns[columnIndex];
+            if (column.Info.IsEmpty)
+            {
+                return;
+            }
+
+            void* destination = ComponentPtr(columnIndex, destinationRow);
+            void* source      = ComponentPtr(columnIndex, sourceRow);
+            if (!destination || !source)
+            {
+                return;
+            }
+
+            if (column.Info.RelocateConstruct)
+            {
+                column.Info.RelocateConstruct(destination, source);
+            }
+            else if (column.Info.MoveConstruct)
+            {
+                column.Info.MoveConstruct(destination, source);
+            }
+            else if (column.Info.CopyConstruct)
+            {
+                column.Info.CopyConstruct(destination, source);
+            }
+            else
+            {
+                throw std::runtime_error("Component is not movable.");
+            }
+        }
+
+    private:
+        NGIN::Memory::SystemAllocator          m_allocator {};
+        NGIN::Containers::Vector<Column>       m_columns;
+        NGIN::Containers::Vector<EntityId>     m_entities;
+        NGIN::UIntSize                         m_count {0};
+        NGIN::UIntSize                         m_capacity {0};
     };
 
     class Archetype
     {
     public:
-        explicit Archetype(ArchetypeSignature sig, NGIN::Containers::Vector<ComponentInfo> components)
-            : m_signature(std::move(sig)), m_components(std::move(components))
+        explicit Archetype(ArchetypeSignature signature, NGIN::Containers::Vector<ComponentInfo> components)
+            : m_signature(std::move(signature)), m_components(std::move(components))
         {
-            m_columns.Reserve(m_components.Size());
-            for (NGIN::UIntSize i = 0; i < m_components.Size(); ++i)
-            {
-                ColumnLayout cl {};
-                cl.Info   = m_components[i];
-                cl.Stride = cl.Info.IsEmpty ? 0 : cl.Info.Size;
-                m_columns.EmplaceBack(cl);
-            }
-            m_rowStride = ComputeRowStrideBytes();
         }
 
+        Archetype(const Archetype&)            = delete;
+        Archetype& operator=(const Archetype&) = delete;
+        Archetype(Archetype&&)                 = delete;
+        Archetype& operator=(Archetype&&)      = delete;
+
         [[nodiscard]] const ArchetypeSignature& Signature() const noexcept { return m_signature; }
-        [[nodiscard]] NGIN::UIntSize             ComponentCount() const noexcept { return m_components.Size(); }
-        [[nodiscard]] const ColumnLayout&        ColumnAt(NGIN::UIntSize i) const noexcept { return m_columns[i]; }
-        [[nodiscard]] NGIN::UIntSize             RowStrideBytes() const noexcept { return m_rowStride; }
-        [[nodiscard]] NGIN::UIntSize             ColumnIndexOf(TypeId id) const
+        [[nodiscard]] NGIN::UIntSize ComponentCount() const noexcept { return m_components.Size(); }
+        [[nodiscard]] const ComponentInfo& ComponentAt(NGIN::UIntSize index) const noexcept { return m_components[index]; }
+        [[nodiscard]] NGIN::UIntSize ChunkCount() const noexcept { return m_chunks.Size(); }
+
+        [[nodiscard]] Chunk* GetChunk(NGIN::UIntSize index) const noexcept
         {
-            for (NGIN::UIntSize i = 0; i < m_columns.Size(); ++i)
-                if (m_columns[i].Info.id == id)
-                    return i;
-            throw std::out_of_range("Component not in archetype");
+            return m_chunks[index].Get();
+        }
+
+        [[nodiscard]] bool HasComponent(TypeId typeId) const noexcept
+        {
+            return FindColumnIndex(typeId) != kInvalidIndex;
+        }
+
+        [[nodiscard]] NGIN::UIntSize FindColumnIndex(TypeId typeId) const noexcept
+        {
+            for (NGIN::UIntSize index = 0; index < m_components.Size(); ++index)
+            {
+                if (m_components[index].id == typeId)
+                {
+                    return index;
+                }
+            }
+            return kInvalidIndex;
+        }
+
+        [[nodiscard]] NGIN::UIntSize ColumnIndexOf(TypeId typeId) const
+        {
+            const auto index = FindColumnIndex(typeId);
+            if (index == kInvalidIndex)
+            {
+                throw std::out_of_range("Component is not present in archetype.");
+            }
+            return index;
         }
 
         [[nodiscard]] NGIN::UIntSize ComputeCapacityForChunkBytes(NGIN::UIntSize chunkBytes) const noexcept
         {
-            auto stride = m_rowStride + sizeof(EntityId); // include entity id per row
-            if (stride == 0) return chunkBytes; // degenerate
-            auto cap = static_cast<NGIN::UIntSize>(chunkBytes / stride);
-            return cap == 0 ? 1 : cap;
-        }
-
-        Chunk* GetChunkWithRoom()
-        {
-            if (m_chunks.Size() == 0 || !m_chunks[m_chunks.Size() - 1]->HasRoom())
+            NGIN::UIntSize rowBytes = sizeof(EntityId);
+            for (NGIN::UIntSize index = 0; index < m_components.Size(); ++index)
             {
-                const auto cap = ComputeCapacityForChunkBytes(kDefaultChunkBytes);
-                auto*      ch  = new Chunk(m_columns, cap);
-                m_chunks.EmplaceBack(ch);
-            }
-            return m_chunks[m_chunks.Size() - 1];
-        }
-
-        [[nodiscard]] Chunk* GetChunk(NGIN::UIntSize i) const { return m_chunks[i]; }
-
-        template<typename... Cs>
-        void Insert(EntityId id, NGIN::UInt64 epoch, const Cs&... cs)
-        {
-            auto* chunk = GetChunkWithRoom();
-            // Build aligned pointer list matching column order
-            m_valueScratch.Reserve(m_columns.Size());
-            m_valueScratch.Clear();
-            for (NGIN::UIntSize c = 0; c < m_columns.Size(); ++c)
-            {
-                if (m_columns[c].Info.IsEmpty || m_columns[c].Stride == 0)
+                rowBytes += (2 * sizeof(NGIN::UInt64));
+                if (!m_components[index].IsEmpty)
                 {
-                    m_valueScratch.EmplaceBack(nullptr);
-                }
-                else
-                {
-                    m_valueScratch.EmplaceBack(FindValuePtr(m_columns[c].Info.id, cs...));
+                    rowBytes += m_components[index].Size;
                 }
             }
-            chunk->AddRow(id, m_columns, m_valueScratch.data(), epoch);
+            if (rowBytes == 0)
+            {
+                return 1;
+            }
+            const auto capacity = chunkBytes / rowBytes;
+            return capacity == 0 ? 1 : capacity;
         }
 
-        void InsertDynamic(EntityId id, NGIN::UInt64 epoch, const NGIN::Containers::Vector<ComponentPayload>& values)
+        template<typename Initializer>
+        [[nodiscard]] ArchetypeRowAddress EmplaceRow(EntityId entityId, Initializer&& initializer)
         {
-            auto* chunk = GetChunkWithRoom();
-            m_valueScratch.Reserve(m_columns.Size());
-            m_valueScratch.Clear();
-            for (NGIN::UIntSize c = 0; c < m_columns.Size(); ++c)
+            auto [chunkIndex, chunk] = EnsureChunkWithRoom();
+            const auto row = chunk->BeginRow(entityId);
+
+            NGIN::UIntSize completedColumns = 0;
+            try
             {
-                if (m_columns[c].Info.IsEmpty || m_columns[c].Stride == 0)
+                for (; completedColumns < m_components.Size(); ++completedColumns)
                 {
-                    m_valueScratch.EmplaceBack(nullptr);
-                    continue;
+                    initializer(*chunk, chunkIndex, row, completedColumns, m_components[completedColumns]);
                 }
-                const TypeId need = m_columns[c].Info.id;
-                const void*  ptr  = nullptr;
-                for (NGIN::UIntSize i = 0; i < values.Size(); ++i)
+            } catch (...)
+            {
+                chunk->RollbackNewRow(row, completedColumns);
+                throw;
+            }
+
+            return ArchetypeRowAddress {chunkIndex, row};
+        }
+
+        template<typename RelocatedEntityFn>
+        void RemoveRow(NGIN::UIntSize chunkIndex, NGIN::UIntSize rowIndex, RelocatedEntityFn&& relocatedEntityFn)
+        {
+            auto* chunk = GetChunk(chunkIndex);
+            if (!chunk)
+            {
+                throw std::out_of_range("Chunk index out of range.");
+            }
+
+            const auto rowResult = chunk->SwapRemoveRow(rowIndex);
+            if (rowResult.HadMovedEntity)
+            {
+                relocatedEntityFn(rowResult.MovedEntity, chunkIndex, rowResult.NewRowIndex);
+            }
+
+            if (chunk->Count() == 0)
+            {
+                const auto lastChunkIndex = m_chunks.Size() - 1;
+                if (chunkIndex != lastChunkIndex)
                 {
-                    if (values[i].id == need)
+                    m_chunks[chunkIndex] = std::move(m_chunks[lastChunkIndex]);
+                    auto* movedChunk = m_chunks[chunkIndex].Get();
+                    for (NGIN::UIntSize row = 0; row < movedChunk->Count(); ++row)
                     {
-                        ptr = values[i].data;
-                        break;
+                        relocatedEntityFn(movedChunk->EntityAt(row), chunkIndex, row);
                     }
                 }
-                if (!ptr)
-                    throw std::invalid_argument("Missing component value for column");
-                m_valueScratch.EmplaceBack(ptr);
+                m_chunks.PopBack();
             }
-            chunk->AddRow(id, m_columns, m_valueScratch.data(), epoch);
-        }
-
-        [[nodiscard]] NGIN::UIntSize ChunkCount() const noexcept { return m_chunks.Size(); }
-        [[nodiscard]] NGIN::UIntSize LastChunkCapacity() const noexcept
-        {
-            if (m_chunks.Size() == 0) return 0;
-            return m_chunks[m_chunks.Size() - 1]->Capacity();
         }
 
     private:
-        [[nodiscard]] NGIN::UIntSize ComputeRowStrideBytes() const noexcept
+        [[nodiscard]] std::pair<NGIN::UIntSize, Chunk*> EnsureChunkWithRoom()
         {
-            NGIN::UIntSize bytes = 0;
-            for (NGIN::UIntSize i = 0; i < m_components.Size(); ++i)
+            if (m_chunks.Size() == 0 || !m_chunks[m_chunks.Size() - 1]->HasRoom())
             {
-                if (!m_components[i].IsEmpty)
-                    bytes += m_components[i].Size;
+                auto chunk = NGIN::Memory::MakeScoped<Chunk>(
+                    m_components,
+                    ComputeCapacityForChunkBytes(kDefaultChunkBytes)
+                );
+                m_chunks.EmplaceBack(std::move(chunk));
             }
-            return bytes;
+            return {m_chunks.Size() - 1, m_chunks[m_chunks.Size() - 1].Get()};
         }
 
-        template<typename T0>
-        static const void* FindValuePtr(TypeId id, const T0& v0)
-        {
-            if (GetTypeId<T0>() == id) return &v0;
-            return nullptr;
-        }
-        template<typename T0, typename T1, typename... Rest>
-        static const void* FindValuePtr(TypeId id, const T0& v0, const T1& v1, const Rest&... rest)
-        {
-            if (GetTypeId<T0>() == id) return &v0;
-            return FindValuePtr(id, v1, rest...);
-        }
-
-        ArchetypeSignature                        m_signature;
-        NGIN::Containers::Vector<ComponentInfo>   m_components; // canonical order
-        NGIN::Containers::Vector<ColumnLayout>    m_columns;
-        NGIN::Containers::Vector<Chunk*>          m_chunks;
-        NGIN::UIntSize                            m_rowStride {0};
-
-        // Scratch buffer for value pointers during insertion
-        NGIN::Containers::Vector<const void*>     m_valueScratch;
+    private:
+        ArchetypeSignature                                      m_signature;
+        NGIN::Containers::Vector<ComponentInfo>                 m_components;
+        NGIN::Containers::Vector<NGIN::Memory::Scoped<Chunk>>   m_chunks;
     };
 }
 
@@ -306,9 +501,9 @@ namespace std
     template<>
     struct hash<NGIN::ECS::ArchetypeSignature>
     {
-        size_t operator()(const NGIN::ECS::ArchetypeSignature& s) const noexcept
+        size_t operator()(const NGIN::ECS::ArchetypeSignature& signature) const noexcept
         {
-            return static_cast<size_t>(s.Hash);
+            return static_cast<size_t>(signature.Hash);
         }
     };
 }

@@ -1,5 +1,5 @@
 /// @file SchedulerTests.cpp
-/// @brief Tests for system DAG scheduling and stage barriers (command flush).
+/// @brief Typed system params, stage planning, and exclusive execution.
 
 #include <boost/ut.hpp>
 
@@ -10,50 +10,111 @@ using namespace boost::ut;
 
 namespace
 {
-    struct A { int v; };
-    struct B { int v; };
-    struct Tag {};
+    struct A
+    {
+        int value;
+    };
+
+    struct Tag
+    {
+    };
 }
 
 suite<"NGIN::ECS::Scheduler"> schedSuite = [] {
-  "Topo_Order_WriteRead"_test = [] {
+  "Typed_Params_Derive_WriteRead_Stages"_test = [] {
     NGIN::ECS::World     world;
-    NGIN::ECS::Scheduler sched;
+    NGIN::ECS::Scheduler scheduler;
 
+    (void)world.Spawn(A{1});
     std::vector<int> order;
-    auto s1 = NGIN::ECS::MakeSystem<NGIN::ECS::Write<A>>("S1", [&](NGIN::ECS::World& w, NGIN::ECS::Commands&) {
-      (void)w; order.push_back(1);
+
+    auto writer = NGIN::ECS::MakeSystem("Writer", [&](NGIN::ECS::Query<NGIN::ECS::Write<A>>& query) {
+      order.push_back(1);
+      query.ForEach([&](const NGIN::ECS::RowView& row) {
+        row.Write<A>().value += 5;
+        row.MarkChanged<A>();
+      });
     });
-    auto s2 = NGIN::ECS::MakeSystem<NGIN::ECS::Read<A>>("S2", [&](NGIN::ECS::World& w, NGIN::ECS::Commands&) {
-      (void)w; order.push_back(2);
+
+    auto reader = NGIN::ECS::MakeSystem("Reader", [&](NGIN::ECS::Query<NGIN::ECS::Read<A>>& query) {
+      order.push_back(2);
+      NGIN::UIntSize seen = 0;
+      query.ForEach([&](const NGIN::ECS::RowView& row) {
+        ++seen;
+        expect(row.Read<A>().value == 6_i);
+      });
+      expect(eq(seen, 1_u));
     });
-    sched.Register(s1);
-    sched.Register(s2);
-    sched.Build();
-    sched.Run(world);
+
+    scheduler.Register(writer);
+    scheduler.Register(reader);
+    scheduler.Build();
+
+    expect(eq(scheduler.StageCount(), 2_u));
+    scheduler.Run(world);
     expect(order.size() == 2_u);
     expect(order[0] == 1_i && order[1] == 2_i);
-    expect(sched.StageCount() >= 1_u);
   };
 
-  "Barrier_Flush_Applies_Spawn_Tag"_test = [] {
+  "Commands_Param_Forces_Barrier_And_Flush"_test = [] {
     NGIN::ECS::World     world;
-    NGIN::ECS::Scheduler sched;
+    NGIN::ECS::Scheduler scheduler;
 
-    auto spawnSys = NGIN::ECS::MakeSystem<NGIN::ECS::Write<Tag>>("Spawn", [&](NGIN::ECS::World& w, NGIN::ECS::Commands& cmd) {
+    auto spawner = NGIN::ECS::MakeSystem("Spawner", [&](NGIN::ECS::Commands& commands) {
       for (int i = 0; i < 10; ++i)
-        cmd.Spawn(Tag{});
+      {
+          commands.Spawn(Tag{});
+      }
     });
-    auto readSys = NGIN::ECS::MakeSystem<NGIN::ECS::Read<Tag>>("Read", [&](NGIN::ECS::World& w, NGIN::ECS::Commands&) {
-      NGIN::ECS::Query<NGIN::ECS::Read<Tag>> q{w};
+
+    auto counter = NGIN::ECS::MakeSystem("Counter", [&](NGIN::ECS::Query<NGIN::ECS::Read<Tag>>& query) {
       NGIN::UIntSize count = 0;
-      q.for_chunks([&](const NGIN::ECS::ChunkView& ch){ count += (ch.end() - ch.begin()); });
-      expect(count == 10_u);
+      query.ForEach([&](const NGIN::ECS::RowView&) { ++count; });
+      expect(eq(count, 10_u));
     });
-    sched.Register(spawnSys);
-    sched.Register(readSys);
-    sched.Build();
-    sched.Run(world);
+
+    scheduler.Register(spawner);
+    scheduler.Register(counter);
+    scheduler.Build();
+
+    expect(eq(scheduler.StageCount(), 2_u));
+    scheduler.Run(world);
+  };
+
+  "Exclusive_System_Runs_In_Its_Own_Stage"_test = [] {
+    NGIN::ECS::World     world;
+    NGIN::ECS::Scheduler scheduler;
+
+    (void)world.Spawn(A{1});
+    std::vector<int> order;
+
+    auto reader = NGIN::ECS::MakeSystem("Reader", [&](NGIN::ECS::Query<NGIN::ECS::Read<A>>& query) {
+      order.push_back(1);
+      NGIN::UIntSize count = 0;
+      query.ForEach([&](const NGIN::ECS::RowView&) { ++count; });
+      expect(eq(count, 1_u));
+    });
+
+    auto exclusive = NGIN::ECS::MakeExclusiveSystem("Exclusive", [&](NGIN::ECS::ExclusiveWorld worldAccess) {
+      order.push_back(2);
+      worldAccess->Clear();
+    });
+
+    auto counter = NGIN::ECS::MakeSystem("Counter", [&](NGIN::ECS::Query<NGIN::ECS::Read<A>>& query) {
+      order.push_back(3);
+      NGIN::UIntSize count = 0;
+      query.ForEach([&](const NGIN::ECS::RowView&) { ++count; });
+      expect(eq(count, 0_u));
+    });
+
+    scheduler.Register(reader);
+    scheduler.Register(exclusive);
+    scheduler.Register(counter);
+    scheduler.Build();
+
+    expect(eq(scheduler.StageCount(), 3_u));
+    scheduler.Run(world);
+    expect(order.size() == 3_u);
+    expect(order[0] == 1_i && order[1] == 2_i && order[2] == 3_i);
   };
 };
-

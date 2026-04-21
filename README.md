@@ -1,113 +1,187 @@
 # NGIN.ECS
 
-NGIN.ECS is a C++23 entity-component-system library in the NGIN family.
+NGIN.ECS is a C++23 library for organizing game or simulation logic using an **entity-component-system (ECS)** model.
 
-It is built around a data-oriented model with archetypes, chunked storage, and explicit system access patterns.
+If you haven’t used an ECS before, the idea is simple:
 
-The short version is:
+* **Entities** are just IDs
+* **Components** are plain data (position, velocity, health, etc.)
+* **Systems** run over many entities at once and update that data
 
-- entities are lightweight handles
-- components are plain data
-- systems operate through queries
-- storage is cache-friendly
-- scheduling is intended to remain deterministic and explicit
+Instead of attaching behavior to objects, you write logic that operates on groups of data.
 
-It is designed to be useful as a standalone ECS library, not only inside the full NGIN platform.
+---
 
-## What NGIN.ECS Is For
-
-NGIN.ECS is for applications that want:
-
-- ECS-style composition
-- data-oriented storage
-- explicit read/write access patterns
-- deterministic system execution
-- a path toward safe scheduling and deferred structural changes
-
-Typical uses include:
-
-- gameplay/runtime simulation
-- tool-side world state and previews
-- data-oriented application subsystems
-
-## The Core Model
-
-### Entity
-
-A lightweight identifier for a thing.
-
-### Component
-
-Plain data attached to entities.
-
-Examples:
-
-- `Transform`
-- `Velocity`
-- `Health`
-
-### Query
-
-A way to iterate over entities that match a component shape.
-
-### System
-
-Logic that reads and writes components through queries.
-
-### Commands
-
-A deferred way to perform structural changes such as spawning or despawning.
-
-## Quick Example
+## A minimal example
 
 ```cpp
-#include <NGIN/ECS/World.hpp>
-#include <NGIN/ECS/Query.hpp>
-
 struct Transform { float x, y, z; };
 struct Velocity  { float vx, vy, vz; };
 
-NGIN::ECS::World world;
-for (int i = 0; i < 1000; ++i)
-{
-    (void)world.Spawn(Transform{float(i), 0, 0}, Velocity{1, 2, 3});
-}
+World world;
 
-NGIN::ECS::Query<NGIN::ECS::Write<Transform>, NGIN::ECS::Read<Velocity>> query{world};
-query.for_chunks([&](const NGIN::ECS::ChunkView& chunk) {
-    auto* transforms = chunk.write<Transform>();
-    const auto* velocities = chunk.read<Velocity>();
-    for (auto i = chunk.begin(); i < chunk.end(); ++i)
-    {
-        transforms[i].x += velocities[i].vx;
-    }
+world.Spawn(
+    Transform{0, 0, 0},
+    Velocity{1, 0, 0}
+);
+
+Query<Write<Transform>, Read<Velocity>> query {world};
+
+query.ForEach([&](const RowView& row) {
+    auto& t = row.Write<Transform>();
+    const auto& v = row.Read<Velocity>();
+
+    t.x += v.vx;
 });
 ```
 
-## What It Provides
+This updates every entity that has both `Transform` and `Velocity`.
 
-NGIN.ECS provides:
+---
 
-- entity IDs
-- component-oriented world storage
-- archetypes and chunked columnar layout
-- queries over component sets
-- deferred structural commands
-- scheduler-oriented access declarations
-- change detection support through epochs
+## How to think about it
 
-## Build Targets
+NGIN.ECS stores entities in tables (called **archetypes**) based on the components they have.
 
-- `NGIN::ECS`
+A query like:
 
-## Build Options
+```cpp
+Query<Write<Transform>, Read<Velocity>>
+```
 
-Main CMake options:
+means:
 
-- `NGIN_ECS_BUILD_TESTS` default `ON`
-- `NGIN_ECS_BUILD_EXAMPLES` default `OFF`
+> “Give me all rows where both of these components exist.”
 
-## Typical Local Build
+Each iteration gives you direct access to that row’s data — no lookups, no indirection.
+
+---
+
+## Why this style is useful
+
+This approach makes it easy to:
+
+* process large numbers of entities efficiently
+* keep data layout predictable
+* separate data from behavior cleanly
+
+It’s commonly used in:
+
+* games
+* simulations
+* real-time systems
+
+---
+
+## What NGIN.ECS focuses on
+
+Instead of trying to hide how ECS works, NGIN.ECS keeps things explicit:
+
+### Direct data access
+
+You work with references to components directly:
+
+```cpp
+auto& transform = row.Write<Transform>();
+```
+
+There’s no wrapper or proxy layer.
+
+---
+
+### Normal C++ types
+
+Components can be anything:
+
+* `std::string`
+* `std::vector<T>`
+* move-only types
+
+They behave exactly as expected (construct, move, destroy).
+
+---
+
+### Immediate changes
+
+When you remove something, it’s gone:
+
+```cpp
+world.Despawn(entity);
+```
+
+There’s no delayed cleanup step to keep track of.
+
+---
+
+### Systems describe their inputs
+
+```cpp
+MakeSystem("Move", [](Query<
+    Write<Transform>,
+    Read<Velocity>
+>& query) {
+    ...
+});
+```
+
+The types in the function signature describe what the system reads and writes.
+
+This is used to organize execution safely.
+
+---
+
+## Common operations
+
+```cpp
+auto e = world.Spawn(Transform{...});
+
+world.Get<Transform>(e);
+world.GetMut<Transform>(e);
+
+world.Add<Velocity>(e, {...});
+world.Remove<Velocity>(e);
+
+world.Despawn(e);
+```
+
+---
+
+## Change detection
+
+You can track what changed between frames:
+
+```cpp
+world.MarkChanged<Transform>(entity);
+
+Query<Changed<Transform>> query {world};
+```
+
+Use `world.NextEpoch()` to advance the frame.
+
+---
+
+## Running systems
+
+```cpp
+Scheduler scheduler;
+
+scheduler.Register(moveSystem);
+scheduler.Build();
+scheduler.Run(world);
+```
+
+Systems are grouped and executed in a safe order based on what they access.
+
+---
+
+## Examples
+
+* `examples/QuickStart/`
+* `examples/ChangeDetection/`
+
+---
+
+## Build
 
 ```bash
 cmake -S . -B build \
@@ -118,13 +192,14 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-## Where It Fits
+---
 
-Within the NGIN platform, NGIN.ECS is a domain/runtime package that can be pulled into targets which need ECS-style world composition.
+## In short
 
-Outside the platform, it is simply a standalone ECS library built on top of `NGIN.Base`.
+NGIN.ECS gives you:
 
-## Read Next
+* a way to organize data as components
+* a way to process that data in batches
+* full control over how and when things change
 
-- `include/NGIN/ECS/`
-- `examples/`
+Without hiding how it works.

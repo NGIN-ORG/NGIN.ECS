@@ -1,5 +1,5 @@
 /// @file QueryBasicTests.cpp
-/// @brief Basic query iteration over chunks: Read<Velocity>, Write<Transform>.
+/// @brief Query iteration, optional terms, and entity-aware access.
 
 #include <boost/ut.hpp>
 
@@ -10,49 +10,98 @@ using namespace boost::ut;
 
 namespace
 {
-    struct Transform { float x, y, z; };
-    struct Velocity { float vx, vy, vz; };
+    struct Transform
+    {
+        float x, y, z;
+    };
+
+    struct Velocity
+    {
+        float vx, vy, vz;
+    };
+
+    struct PlayerTag
+    {
+    };
+
+    struct Disabled
+    {
+    };
 }
 
 suite<"NGIN::ECS::Query"> querySuite = [] {
-  "Move_System_Updates_Transforms"_test = [] {
+  "Move_Query_Updates_Transforms_And_Exposes_Entity"_test = [] {
     NGIN::ECS::World world;
-    const std::size_t N = 1024;
-    for (std::size_t i = 0; i < N; ++i)
+    NGIN::Containers::Vector<NGIN::ECS::EntityId> entities;
+
+    constexpr NGIN::UIntSize N = 128;
+    for (NGIN::UIntSize i = 0; i < N; ++i)
     {
-        Transform t{float(i), 0.0f, 0.0f};
-        Velocity v{1.0f, 2.0f, 3.0f};
-        (void)world.Spawn(t, v);
+        entities.EmplaceBack(world.Spawn(Transform{float(i), 0.0f, 0.0f}, Velocity{1.0f, 2.0f, 3.0f}));
     }
 
-    NGIN::ECS::Query<NGIN::ECS::Read<Velocity>, NGIN::ECS::Write<Transform>> q{world};
-    const float dt = 2.0f;
-    q.for_chunks([&](const NGIN::ECS::ChunkView& chunk){
-      const auto* v = chunk.read<Velocity>();
-      auto*       t = chunk.write<Transform>();
-      for (NGIN::UIntSize i = chunk.begin(); i < chunk.end(); ++i)
+    NGIN::ECS::Query<NGIN::ECS::Write<Transform>, NGIN::ECS::Read<Velocity>> query {world};
+    query.ForEach([&](const NGIN::ECS::RowView& row) {
+      auto&       transform = row.Write<Transform>();
+      const auto& velocity  = row.Read<Velocity>();
+      transform.x += velocity.vx * 2.0f;
+      transform.y += velocity.vy * 2.0f;
+      transform.z += velocity.vz * 2.0f;
+      row.MarkChanged<Transform>();
+      expect(world.IsAlive(row.Entity()));
+    });
+
+    bool ok = true;
+    for (NGIN::UIntSize i = 0; i < entities.Size(); ++i)
+    {
+        const auto& transform = world.Get<Transform>(entities[i]);
+        ok = ok &&
+             transform.x == float(i) + 2.0f &&
+             transform.y == 4.0f &&
+             transform.z == 6.0f;
+    }
+    expect(ok);
+  };
+
+  "Optional_And_WithWithout_Terms_Filter_Correctly"_test = [] {
+    NGIN::ECS::World world;
+
+    const auto withVelocity    = world.Spawn(Transform{1, 0, 0}, Velocity{1, 0, 0}, PlayerTag{});
+    const auto withoutVelocity = world.Spawn(Transform{2, 0, 0}, PlayerTag{});
+    (void)world.Spawn(Transform{3, 0, 0}, Velocity{1, 0, 0}, PlayerTag{}, Disabled{});
+
+    NGIN::UIntSize matched = 0;
+    NGIN::UIntSize withOptionalVelocity = 0;
+    NGIN::UIntSize withoutOptionalVelocity = 0;
+
+    NGIN::ECS::Query<
+        NGIN::ECS::Read<Transform>,
+        NGIN::ECS::Opt<Velocity>,
+        NGIN::ECS::With<PlayerTag>,
+        NGIN::ECS::Without<Disabled>
+    > query {world};
+
+    query.ForChunks([&](const NGIN::ECS::ChunkView& chunk) {
+      for (NGIN::UIntSize rowIndex = 0; rowIndex < chunk.Count(); ++rowIndex)
       {
-        t[i].x += v[i].vx * dt;
-        t[i].y += v[i].vy * dt;
-        t[i].z += v[i].vz * dt;
+        ++matched;
+        const auto entity = chunk.EntityAt(rowIndex);
+        const auto* velocity = chunk.TryRead<Velocity>(rowIndex);
+        if (velocity)
+        {
+            ++withOptionalVelocity;
+            expect(entity == withVelocity);
+        }
+        else
+        {
+            ++withoutOptionalVelocity;
+            expect(entity == withoutVelocity);
+        }
       }
     });
 
-    // Validate via a read-only pass
-    NGIN::ECS::Query<NGIN::ECS::Read<Transform>> qr{world};
-    NGIN::UIntSize count = 0;
-    bool ok = true;
-    qr.for_chunks([&](const NGIN::ECS::ChunkView& chunk){
-      const auto* t = chunk.read<Transform>();
-      for (NGIN::UIntSize i = chunk.begin(); i < chunk.end(); ++i)
-      {
-        const auto base = float(count + i);
-        ok = ok && (t[i].x == base + 1.0f * dt) && (t[i].y == 0.0f + 2.0f * dt) && (t[i].z == 0.0f + 3.0f * dt);
-      }
-      count += (chunk.end() - chunk.begin());
-    });
-    expect(ok) << "Transform updates incorrect";
-    expect(eq(count, static_cast<NGIN::UIntSize>(N)));
+    expect(eq(matched, 2_u));
+    expect(eq(withOptionalVelocity, 1_u));
+    expect(eq(withoutOptionalVelocity, 1_u));
   };
 };
-

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(NGIN.ECS VERSION 0.1 LANGUAGES CXX)
+project(NGIN.ECS VERSION 0.2.0 LANGUAGES CXX)
 
 #-------------------------------------------------------------------------------
 # Policies
@@ -11,6 +11,7 @@ cmake_policy(SET CMP0077 NEW)
 #-------------------------------------------------------------------------------
 option(NGIN_ECS_BUILD_TESTS "Build NGIN.ECS tests" ON)
 option(NGIN_ECS_BUILD_EXAMPLES "Build NGIN.ECS examples" OFF)
+option(NGIN_ECS_BUILD_BENCHMARKS "Build NGIN.ECS benchmarks" OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -139,4 +140,11 @@ endif()
 #-------------------------------------------------------------------------------
 if(NGIN_ECS_BUILD_EXAMPLES)
   add_subdirectory(examples)
+endif()
+
+#-------------------------------------------------------------------------------
+# Benchmarks
+#-------------------------------------------------------------------------------
+if(NGIN_ECS_BUILD_BENCHMARKS)
+  add_subdirectory(benchmarks)
 endif()

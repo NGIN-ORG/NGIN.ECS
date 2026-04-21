@@ -36,16 +36,23 @@ suite<"NGIN::ECS::TypeRegistry"> typeSuite = [] {
     const auto i1 = NGIN::ECS::DescribeComponent<PODType>();
     expect(i1.IsPOD);
     expect(!i1.IsEmpty);
+    expect(i1.IsBitwiseRelocatable);
+    expect(i1.CopyConstruct != nullptr);
+    expect(i1.MoveConstruct != nullptr);
+    expect(i1.RelocateConstruct != nullptr);
     expect(eq(i1.Size, sizeof(PODType)));
     expect(eq(i1.Align, alignof(PODType)));
 
     const auto i2 = NGIN::ECS::DescribeComponent<NonPOD>();
     expect(!i2.IsPOD);
     expect(!i2.IsEmpty);
+    expect(i2.CopyConstruct != nullptr);
+    expect(i2.MoveConstruct != nullptr);
+    expect(i2.RelocateConstruct != nullptr);
+    expect(i2.Destroy != nullptr);
 
     const auto tag = NGIN::ECS::DescribeComponent<TagType>();
     expect(tag.IsEmpty);
     expect(eq(tag.Size, sizeof(TagType)));
   };
 };
-

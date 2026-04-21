@@ -51,8 +51,13 @@ namespace NGIN::ECS
 
     void EntityAllocator::Clear() noexcept
     {
-        m_generations.Clear();
         m_freeList.Clear();
+        for (NGIN::UInt64 index = m_generations.Size(); index > 0; --index)
+        {
+            const auto slotIndex = index - 1;
+            m_generations[slotIndex] = static_cast<NGIN::UInt16>(m_generations[slotIndex] + 1);
+            m_freeList.PushBack(slotIndex);
+        }
         m_aliveCount = 0;
     }
 
@@ -64,4 +69,3 @@ namespace NGIN::ECS
     }
 
 } // namespace NGIN::ECS
-

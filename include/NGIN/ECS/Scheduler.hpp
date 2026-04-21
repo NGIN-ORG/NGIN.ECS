@@ -6,46 +6,192 @@
 #include <NGIN/ECS/Query.hpp>
 #include <NGIN/ECS/Commands.hpp>
 #include <NGIN/Containers/Vector.hpp>
+#include <NGIN/Meta/FunctionTraits.hpp>
 
+#include <algorithm>
 #include <functional>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace NGIN::ECS
 {
+    class ExclusiveWorld
+    {
+    public:
+        explicit ExclusiveWorld(World& world) noexcept
+            : m_world(&world)
+        {
+        }
+
+        [[nodiscard]] World& Get() const noexcept { return *m_world; }
+        [[nodiscard]] World* operator->() const noexcept { return m_world; }
+        [[nodiscard]] World& operator*() const noexcept { return *m_world; }
+
+    private:
+        World* m_world {nullptr};
+    };
+
     struct SystemDescriptor
     {
-        const char*                                       Name {"System"};
-        NGIN::Containers::Vector<TypeId>                  Reads;
-        NGIN::Containers::Vector<TypeId>                  Writes;
-        std::function<void(World&, Commands&)>            Run;
+        const char*                                      Name {"System"};
+        NGIN::Containers::Vector<TypeId>                 Reads;
+        NGIN::Containers::Vector<TypeId>                 Writes;
+        bool                                             Exclusive {false};
+        std::function<void(World&, Commands&, NGIN::UInt64 sinceTick)> Run;
+        NGIN::UInt64                                     LastRunTick {0};
     };
 
     namespace detail
     {
-        template<typename Term>
-        struct CollectRW
+        inline void AppendUnique(NGIN::Containers::Vector<TypeId>& destination,
+                                 const NGIN::Containers::Vector<TypeId>& source)
         {
-            static void Add(SystemDescriptor&) {}
-        };
-        template<typename T>
-        struct CollectRW<Read<T>>
-        {
-            static void Add(SystemDescriptor& d) { d.Reads.EmplaceBack(GetTypeId<T>()); }
-        };
-        template<typename T>
-        struct CollectRW<Write<T>>
-        {
-            static void Add(SystemDescriptor& d) { d.Writes.EmplaceBack(GetTypeId<T>()); }
-        };
-    } // namespace detail
+            for (NGIN::UIntSize index = 0; index < source.Size(); ++index)
+            {
+                destination.EmplaceBack(source[index]);
+            }
+            SortUnique(destination);
+        }
 
-    template<typename... Terms, typename Fn>
-    [[nodiscard]] inline SystemDescriptor MakeSystem(const char* name, Fn&& fn)
+        template<typename Arg>
+        struct SystemParamBinder;
+
+        template<typename... Terms>
+        struct SystemParamBinder<Query<Terms...>>
+        {
+            using StorageType = Query<Terms...>;
+
+            static void Describe(SystemDescriptor& descriptor)
+            {
+                const auto metadata = BuildQueryMetadata<Terms...>();
+                AppendUnique(descriptor.Reads, metadata.Reads);
+                AppendUnique(descriptor.Writes, metadata.Writes);
+            }
+
+            static StorageType Create(World& world, Commands&, NGIN::UInt64 sinceTick)
+            {
+                return StorageType {world, sinceTick};
+            }
+        };
+
+        template<typename... Terms>
+        struct SystemParamBinder<Query<Terms...>&> : SystemParamBinder<Query<Terms...>>
+        {
+        };
+
+        template<typename... Terms>
+        struct SystemParamBinder<const Query<Terms...>&> : SystemParamBinder<Query<Terms...>>
+        {
+        };
+
+        template<>
+        struct SystemParamBinder<Commands&>
+        {
+            using StorageType = std::reference_wrapper<Commands>;
+
+            static void Describe(SystemDescriptor& descriptor)
+            {
+                descriptor.Exclusive = true;
+            }
+
+            static StorageType Create(World&, Commands& commands, NGIN::UInt64)
+            {
+                return std::ref(commands);
+            }
+        };
+
+        template<>
+        struct SystemParamBinder<ExclusiveWorld>
+        {
+            using StorageType = ExclusiveWorld;
+
+            static void Describe(SystemDescriptor& descriptor)
+            {
+                descriptor.Exclusive = true;
+            }
+
+            static StorageType Create(World& world, Commands&, NGIN::UInt64)
+            {
+                return ExclusiveWorld {world};
+            }
+        };
+
+        template<>
+        struct SystemParamBinder<ExclusiveWorld&> : SystemParamBinder<ExclusiveWorld>
+        {
+        };
+
+        template<>
+        struct SystemParamBinder<const ExclusiveWorld&> : SystemParamBinder<ExclusiveWorld>
+        {
+        };
+
+        template<typename Callable, typename Traits, std::size_t... Indices>
+        void DescribeSystemArgs(SystemDescriptor& descriptor, std::index_sequence<Indices...>)
+        {
+            (SystemParamBinder<typename Traits::template ArgNType<Indices>>::Describe(descriptor), ...);
+            SortUnique(descriptor.Reads);
+            SortUnique(descriptor.Writes);
+        }
+
+        template<typename Callable, typename Traits, std::size_t... Indices>
+        auto MakeBoundArgs(World& world,
+                           Commands& commands,
+                           NGIN::UInt64 sinceTick,
+                           std::index_sequence<Indices...>)
+        {
+            return std::tuple<typename SystemParamBinder<typename Traits::template ArgNType<Indices>>::StorageType...> {
+                SystemParamBinder<typename Traits::template ArgNType<Indices>>::Create(world, commands, sinceTick)...
+            };
+        }
+
+        template<typename Callable, typename Traits, std::size_t... Indices>
+        void InvokeSystem(Callable& callable,
+                          World& world,
+                          Commands& commands,
+                          NGIN::UInt64 sinceTick,
+                          std::index_sequence<Indices...>)
+        {
+            auto args = MakeBoundArgs<Callable, Traits>(world, commands, sinceTick, std::index_sequence<Indices...> {});
+            std::apply([&](auto&&... boundArgs) {
+                callable(std::forward<decltype(boundArgs)>(boundArgs)...);
+            }, args);
+        }
+
+        template<typename Callable>
+        [[nodiscard]] SystemDescriptor MakeSystemDescriptor(const char* name, Callable&& callable, bool forceExclusive)
+        {
+            using Fn     = std::decay_t<Callable>;
+            using Traits = NGIN::Meta::FunctionTraits<Fn>;
+
+            SystemDescriptor descriptor {};
+            descriptor.Name = name;
+            DescribeSystemArgs<Fn, Traits>(descriptor, std::make_index_sequence<Traits::NUM_ARGS> {});
+            descriptor.Exclusive = descriptor.Exclusive || forceExclusive;
+
+            descriptor.Run = [fn = std::forward<Callable>(callable)](World& world, Commands& commands, NGIN::UInt64 sinceTick) mutable {
+                InvokeSystem<Fn, Traits>(fn,
+                                         world,
+                                         commands,
+                                         sinceTick,
+                                         std::make_index_sequence<Traits::NUM_ARGS> {});
+            };
+            return descriptor;
+        }
+    }// namespace detail
+
+    template<typename Callable>
+    [[nodiscard]] inline SystemDescriptor MakeSystem(const char* name, Callable&& callable)
     {
-        SystemDescriptor d {};
-        d.Name = name;
-        (detail::CollectRW<Terms>::Add(d), ...);
-        d.Run = std::forward<Fn>(fn);
-        return d;
+        return detail::MakeSystemDescriptor(name, std::forward<Callable>(callable), false);
+    }
+
+    template<typename Callable>
+    [[nodiscard]] inline SystemDescriptor MakeExclusiveSystem(const char* name, Callable&& callable)
+    {
+        return detail::MakeSystemDescriptor(name, std::forward<Callable>(callable), true);
     }
 
     class NGIN_ECS_API Scheduler
@@ -53,128 +199,97 @@ namespace NGIN::ECS
     public:
         Scheduler() = default;
 
-        NGIN::UInt32 Register(const SystemDescriptor& sys)
+        NGIN::UInt32 Register(const SystemDescriptor& system)
         {
             const auto id = static_cast<NGIN::UInt32>(m_systems.Size());
-            m_systems.EmplaceBack(sys);
+            m_systems.EmplaceBack(system);
             return id;
         }
 
         void Build()
         {
-            const auto N = m_systems.Size();
-            m_edges.clear();
-            m_edges.resize(N);
-            m_inDegree.clear();
-            m_inDegree.resize(N, 0);
-
-            auto conflicts = [&](const SystemDescriptor& a, const SystemDescriptor& b) {
-                // Returns true if a must precede b due to write->read or write->write
-                // Edge direction: writer -> other
-                auto hasWriteOn = [&](TypeId t, const NGIN::Containers::Vector<TypeId>& set) {
-                    for (NGIN::UIntSize i = 0; i < set.Size(); ++i)
-                        if (set[i] == t) return true;
-                    return false;
-                };
-                // a writes vs b reads/writes
-                for (NGIN::UIntSize i = 0; i < a.Writes.Size(); ++i)
-                {
-                    const auto t = a.Writes[i];
-                    if (hasWriteOn(t, b.Writes)) return true;
-                    if (hasWriteOn(t, b.Reads)) return true;
-                }
-                return false;
-            };
-
-            for (NGIN::UIntSize i = 0; i < N; ++i)
-            {
-                for (NGIN::UIntSize j = 0; j < N; ++j)
-                {
-                    if (i == j) continue;
-                    const auto& A = m_systems[i];
-                    const auto& B = m_systems[j];
-                    if (conflicts(A, B))
-                    {
-                        // A -> B
-                        m_edges[i].push_back(static_cast<int>(j));
-                        ++m_inDegree[j];
-                    }
-                    else if (conflicts(B, A))
-                    {
-                        // B -> A (we'll add when visiting j,i)
-                    }
-                    else
-                    {
-                        // No direct dependency
-                    }
-                }
-            }
-
-            // Kahn's algorithm; also collect stages (systems whose in-degree becomes zero together form a stage)
             m_stages.clear();
-            NGIN::Containers::Vector<int> zero;
-            for (NGIN::UIntSize i = 0; i < N; ++i)
-                if (m_inDegree[i] == 0)
-                    zero.EmplaceBack(static_cast<int>(i));
+            m_stageBySystem.clear();
+            m_stageBySystem.resize(m_systems.Size(), 0);
 
-            NGIN::Containers::Vector<int> current;
-            NGIN::Containers::Vector<int> next;
-            while (zero.Size() > 0)
+            for (NGIN::UIntSize systemIndex = 0; systemIndex < m_systems.Size(); ++systemIndex)
             {
-                // Stage is the current set of zero in-degree nodes, preserving registration order
-                current = zero;
-                zero.Clear();
-                // Record stage
-                m_stages.emplace_back();
-                m_stages.back().assign(current.begin(), current.end());
-
-                // Decrement neighbors
-                for (NGIN::UIntSize idx = 0; idx < current.Size(); ++idx)
+                int stageIndex = 0;
+                for (NGIN::UIntSize previousIndex = 0; previousIndex < systemIndex; ++previousIndex)
                 {
-                    int u = current[idx];
-                    for (int v: m_edges[u])
+                    if (Conflicts(m_systems[previousIndex], m_systems[systemIndex]) ||
+                        m_systems[previousIndex].Exclusive || m_systems[systemIndex].Exclusive)
                     {
-                        if (--m_inDegree[v] == 0)
-                            zero.EmplaceBack(v);
+                        stageIndex = std::max(stageIndex, m_stageBySystem[previousIndex] + 1);
                     }
                 }
-            }
-            // Note: cycles (e.g., write-write mutual) will keep some nodes with in-degree > 0.
-            // We conservatively place remaining into final serial stage by registration order.
-            NGIN::Containers::Vector<int> remaining;
-            for (NGIN::UIntSize i = 0; i < N; ++i)
-                if (m_inDegree[i] > 0)
-                    remaining.EmplaceBack(static_cast<int>(i));
-            if (remaining.Size() > 0)
-            {
-                m_stages.emplace_back();
-                m_stages.back().assign(remaining.begin(), remaining.end());
+
+                if (m_stages.size() <= static_cast<std::size_t>(stageIndex))
+                {
+                    m_stages.resize(static_cast<std::size_t>(stageIndex + 1));
+                }
+
+                m_stageBySystem[systemIndex] = stageIndex;
+                m_stages[static_cast<std::size_t>(stageIndex)].push_back(static_cast<int>(systemIndex));
             }
         }
 
         void Run(World& world)
         {
+            world.NextEpoch();
             Commands commands;
-            for (auto& stage: m_stages)
+            for (auto& stage : m_stages)
             {
-                for (int idx: stage)
+                for (const int systemIndex : stage)
                 {
-                    auto& sys = m_systems[static_cast<NGIN::UIntSize>(idx)];
-                    if (sys.Run)
-                        sys.Run(world, commands);
+                    auto& system = m_systems[static_cast<NGIN::UIntSize>(systemIndex)];
+                    if (system.Run)
+                    {
+                        system.Run(world, commands, system.LastRunTick);
+                        system.LastRunTick = world.CurrentEpoch();
+                    }
                 }
-                // Barrier: flush commands after stage
                 commands.Flush(world);
             }
         }
 
-        [[nodiscard]] NGIN::UIntSize StageCount() const noexcept { return m_stages.size(); }
-        [[nodiscard]] const std::vector<int>& StageAt(NGIN::UIntSize i) const { return m_stages[i]; }
+        [[nodiscard]] NGIN::UIntSize StageCount() const noexcept
+        {
+            return m_stages.size();
+        }
+
+        [[nodiscard]] const std::vector<int>& StageAt(NGIN::UIntSize stageIndex) const
+        {
+            return m_stages[stageIndex];
+        }
+
+    private:
+        [[nodiscard]] static bool Intersects(const NGIN::Containers::Vector<TypeId>& left,
+                                             const NGIN::Containers::Vector<TypeId>& right)
+        {
+            for (NGIN::UIntSize leftIndex = 0; leftIndex < left.Size(); ++leftIndex)
+            {
+                for (NGIN::UIntSize rightIndex = 0; rightIndex < right.Size(); ++rightIndex)
+                {
+                    if (left[leftIndex] == right[rightIndex])
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        [[nodiscard]] static bool Conflicts(const SystemDescriptor& left, const SystemDescriptor& right)
+        {
+            return Intersects(left.Writes, right.Writes) ||
+                   Intersects(left.Writes, right.Reads) ||
+                   Intersects(left.Reads, right.Writes);
+        }
 
     private:
         NGIN::Containers::Vector<SystemDescriptor> m_systems;
-        std::vector<std::vector<int>>              m_edges;
-        std::vector<int>                           m_inDegree;
+        std::vector<int>                           m_stageBySystem;
         std::vector<std::vector<int>>              m_stages;
     };
 }
